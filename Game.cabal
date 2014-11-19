@@ -24,5 +24,6 @@ executable Game
     , OpenGL
     , GLFW-b
     , elerea
+    , random
   hs-source-dirs: src      
   default-language:    Haskell2010
