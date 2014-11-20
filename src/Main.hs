@@ -1,9 +1,12 @@
+{-# LANGUAGE RecursiveDo #-}
 module Main where
 
-import Graphics.Rendering.OpenGL
+import Graphics.Rendering.OpenGL hiding (Front)
 import Graphics.UI.GLFW (Window, Key(..), KeyState(..))
 import qualified Graphics.UI.GLFW as GLFW
 import FRP.Elerea.Simple
+import Graphics.Rendering.FTGL (Font, RenderMode(..))
+import qualified Graphics.Rendering.FTGL as FTGL
 
 import Control.Monad
 import Control.Monad.Fix
@@ -117,11 +120,15 @@ main = do
   withWindow width height title $ \win -> do
     initGL width height
     randomGen <- newStdGen
-    network <- start $ do
-      player <- transfer initialPlayer (\s dk -> movePlayer width height s dk) dirKey
-      randomNumber <- stateful (undefined, randomGen) nextRandom
-      monster <- transfer2 initialMonster (wanderOrHunt width height) player randomNumber
-      return $ renderFrame win <$> player <*> monster -- <*> randomNumber
+    let randSeries = randoms randomGen
+    font <- FTGL.createTextureFont "fonts/good-times.ttf"
+    network <- start $ mdo
+      player <- transfer2 initialPlayer (\s dead dk -> movePlayer width height s dk dead) dirKey gameover'
+      randomNumbers <- stateful randSeries pop
+      monster <- transfer3 initialMonster (wanderOrHunt width height) player randomNumbers gameover'
+      gameover <- memo $ playerEaten <$> player <*> monster
+      gameover' <- delay False gameover
+      return $ renderFrame win font <$> player <*> monster <*> gameover
     fix $ \loop -> do
       readInput win dirKeySink
       join network
@@ -130,7 +137,7 @@ main = do
       unless esc loop
     exitSuccess
   where
-    nextRandom (a, g) = random g
+    pop (x:xs) = xs
 
 initGL :: Int -> Int -> IO ()
 initGL width height = do
@@ -146,20 +153,21 @@ readInput window dirKeySink = do
   d <- keyIsPressed window Key'Down
   dirKeySink (l, r, u, d)
 
-movePlayer :: Int -> Int -> Movement -> Player -> Player
-movePlayer _ _ (True, _, _, _) player@(Player (Vector2 xpos ypos) pSize inc)
+movePlayer :: Int -> Int -> Movement -> Player -> Bool -> Player
+movePlayer _ _ _ player True = player
+movePlayer _ _ (True, _, _, _) player@(Player (Vector2 xpos ypos) pSize inc) _
   | xpos <= pSize / 2 = player
   | otherwise = Player (Vector2 (xpos - inc) ypos) pSize inc
-movePlayer w _ (_, True, _, _) player@(Player (Vector2 xpos ypos) pSize inc)
+movePlayer w _ (_, True, _, _) player@(Player (Vector2 xpos ypos) pSize inc) _
   | xpos >= ((fromIntegral w) - pSize / 2) = player
   | otherwise = Player (Vector2 (xpos + inc) ypos) pSize inc
-movePlayer _ h (_, _, True, _) player@(Player (Vector2 xpos ypos) pSize inc)
+movePlayer _ h (_, _, True, _) player@(Player (Vector2 xpos ypos) pSize inc) _
   | ypos >= ((fromIntegral h) - pSize / 2) = player
   | otherwise = Player (Vector2 xpos (ypos + inc)) pSize inc
-movePlayer _ _ (_, _, _, True) player@(Player (Vector2 xpos ypos) pSize inc)
+movePlayer _ _ (_, _, _, True) player@(Player (Vector2 xpos ypos) pSize inc) _
   | ypos <= pSize / 2 = player
   | otherwise = Player (Vector2 xpos (ypos - inc)) pSize inc
-movePlayer _ _ _ player = player
+movePlayer _ _ _ player _ = player
 
 keyIsPressed :: Window -> Key -> IO Bool
 keyIsPressed win key = fmap isPress $ GLFW.getKey win key
@@ -169,8 +177,8 @@ isPress KeyState'Pressed = True
 isPress KeyState'Repeating = True
 isPress _ = False
 
-renderFrame :: Window -> Player -> Monster -> IO ()
-renderFrame window (Player (Vector2 xpos ypos) pSize _) (Monster (Vector2 xmon ymon) monSize _ _)= do
+renderFrame :: Window -> Font -> Player -> Monster -> Bool -> IO ()
+renderFrame window font (Player (Vector2 xpos ypos) pSize _) (Monster (Vector2 xmon ymon) monSize _ monState) gameOver = do
   let half = pSize / 2
   clear [ColorBuffer]
   color $ Color4 0 1 0 (1 :: GLdouble)
@@ -179,17 +187,21 @@ renderFrame window (Player (Vector2 xpos ypos) pSize _) (Monster (Vector2 xmon y
     vertex $ Vertex2 (xpos + half) (ypos - half)
     vertex $ Vertex2 (xpos + half) (ypos + half)
     vertex $ Vertex2 (xpos - half) (ypos + half)
-  color $ Color4 1 0 0 (1 :: GLdouble)
+  color $ case monState of
+            Hunting -> Color4 1 0 0 (1 :: GLdouble)
+            Wander _ _ -> Color4 0 0 1 (1 :: GLdouble)
   renderPrimitive Triangles $ do
     vertex $ Vertex2 (xmon - monSize / 2) (ymon - monSize / 2)
     vertex $ Vertex2 (xmon + monSize / 2) (ymon - monSize / 2)
     vertex $ Vertex2 xmon (ymon + monSize / 2)
   color $ Color4 1 1 1 (1 :: GLdouble)
+  when gameOver $ printText font 24 (220, 240) "Game Over :("
   flush
   GLFW.swapBuffers window
 
--- wanderOrHunt :: Player -> () -> Monster -> Monster
-wanderOrHunt width height player (randDir, _) monster =
+wanderOrHunt :: Int -> Int -> Player -> [Direction] -> Bool -> Monster -> Monster
+wanderOrHunt _ _ _ _ True monster = monster
+wanderOrHunt width height player randDir _ monster =
   if close player monster
     then hunt player monster
     else wander width height randDir monster
@@ -206,24 +218,37 @@ hunt (Player (Vector2 xpos ypos) _ _) (Monster (Vector2 xmon ymon) monSize monSp
   Monster (Vector2 (xmon + (signum (xpos - xmon)) * monSpeed)
                    (ymon + (signum (ypos - ymon)) * monSpeed)) monSize monSpeed Hunting
 
-wander :: Int -> Int -> Direction -> Monster -> Monster
+-- It appears not to go right
+wander :: Int -> Int -> [Direction] -> Monster -> Monster
 wander _ _ randDir (Monster (Vector2 xmon ymon) mSize mSpeed (Wander _ 0)) =
-  Monster (Vector2 xmon ymon) mSize mSpeed (Wander randDir wanderDist)
+  Monster (Vector2 xmon ymon) mSize mSpeed (Wander (head randDir) wanderDist)
 wander _ _ randDir (Monster (Vector2 xmon ymon) mSize mSpeed Hunting) =
-  Monster (Vector2 xmon ymon) mSize mSpeed (Wander randDir wanderDist)
+  Monster (Vector2 xmon ymon) mSize mSpeed (Wander (head randDir) wanderDist)
 wander width height _ (Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkUp n))
-  | ymon < (fromIntegral height - mSize / 2) =
+  | ymon < (fromIntegral height - mSize) =
       Monster (Vector2 xmon (ymon + mSpeed)) mSize mSpeed (Wander WalkUp (n - 1))
   | otherwise = Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkDown (n - 1))
 wander width height _ (Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkDown n))
-  | ymon > mSize / 2 =
+  | ymon > mSize =
       Monster (Vector2 xmon (ymon - mSpeed)) mSize mSpeed (Wander WalkDown (n - 1))
   | otherwise = Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkUp (n - 1))
 wander width height _ (Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkLeft n))
-  | xmon > mSize / 2 =
+  | xmon > mSize =
       Monster (Vector2 (xmon - mSpeed) ymon) mSize mSpeed (Wander WalkLeft (n - 1))
   | otherwise = Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkRight (n - 1))
 wander width height _ (Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkRight n))
-  | xmon > (fromIntegral width - mSize / 2) =
+  | xmon < (fromIntegral width - mSize) =
       Monster (Vector2 (xmon + mSpeed) ymon) mSize mSpeed (Wander WalkRight (n - 1))
   | otherwise = Monster (Vector2 xmon ymon) mSize mSpeed (Wander WalkLeft (n - 1))
+
+playerEaten :: Player -> Monster -> Bool
+playerEaten player monster = distance player monster < 10
+
+printText :: Font -> Int -> (GLdouble, GLdouble) -> String -> IO ()
+printText font size (xpos, ypos) text = do
+  color $ Color4 0 0 0 (1 :: GLdouble)
+  FTGL.setFontFaceSize font size 72
+  preservingMatrix $ do
+    translate (Vector3 xpos ypos 0)
+    FTGL.renderFont font text Front
+  color $ Color4 1 1 1 (1 :: GLdouble)
